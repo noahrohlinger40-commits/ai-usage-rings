@@ -296,14 +296,41 @@ def reset_text(epoch, now=None) -> str:
     return "resets " + datetime.fromtimestamp(epoch).strftime("%a %I:%M %p").replace(" 0", " ")
 
 
-BG, EDGE, TRACK, TEXT, MUTED = "#f3f4f6", "#d6d9df", "#dde0e6", "#16171b", "#6a6f7a"  # the pill's palette
-FONTS = {"name": ("Segoe UI", 7), "pct": ("Segoe UI Semibold", 11)}
+def rshort(epoch, now=None) -> str:
+    """Reset time short enough for the pill: 48m, 2h 10m, 3d 4h."""
+    left = (epoch or 0) - (now or time.time())
+    if not epoch or left <= 0:
+        return ""
+    m = int(left // 60)
+    return f"{m}m" if m < 60 else f"{m // 60}h {m % 60}m" if m < 1440 else f"{m // 1440}d {m % 1440 // 60}h"
 
 
-def ring_colour(percent: float, state: str) -> str:
+ACCENT = "#2f7df6"  # move-mode edge and the lock pulse
+# colour name -> (background, edge, ring track, text, muted text, ring under 70%, dark?).
+# Rings take the theme's colour until 70%; orange, red and amber stay the same everywhere so warnings still read.
+THEMES = {
+    "Light": ("#f3f4f6", "#d6d9df", "#dde0e6", "#16171b", "#6a6f7a", "#1fa970", False),
+    "Midnight": ("#13151b", "#2c303b", "#262a33", "#f1f3f7", "#8b93a3", "#7aa2ff", True),
+    "Navy": ("#0e1420", "#27324a", "#222c42", "#eef2fb", "#7f8ba6", "#4fb3ff", True),
+    "Paper": ("#fbfaf7", "#e0dcd2", "#e9e5dc", "#1c1d21", "#8a8578", "#2a8c82", False),
+    "Forest": ("#12261d", "#2a4a3a", "#1f3a2d", "#e6efe3", "#9bb8a4", "#9fd8a9", True),
+    "Black": ("#000000", "#2a2a2a", "#1c1c1c", "#ffffff", "#8a8a8a", "#38e1ff", True),
+    "Glass": ("#5a5f6b", "#7a808d", "#4a4f5a", "#f4f5f8", "#c3c8d2", "#eef1f7", True),
+    "Mocha": ("#2b211c", "#4a3a30", "#3a2d25", "#f3e6d3", "#b79f86", "#e6d5bd", True),
+    "Purple": ("#1d1233", "#3b2a63", "#2c1f4c", "#f0eaff", "#a798c9", "#b79cff", True),
+}
+SIDE_SPOTS = True  # False: six spots only (top and bottom rows); True: side middles too, as a vertical column
+VCOL = {"Rings": 128, "Number in ring": 156, "Bars": 150}  # column width on a side spot, logical px
+GAP = 5  # gap between stacked chips (and the room between stacked segments)
+LAYOUTS = {"Rings": (400, 40), "Number in ring": (440, 46), "Bars": (440, 46)}  # logical width x height
+
+
+def ring_colour(percent: float, state: str, dark=False, ok=None) -> str:
     if state == WAITING:
-        return "#d69a00"  # amber: it needs you
-    return "#d9363e" if percent >= 90 else "#e57f10" if percent >= 70 else "#1fa970"
+        return "#ffc233" if dark else "#d69a00"  # amber: it needs you
+    if dark:
+        return "#ff5c64" if percent >= 90 else "#ff9a3c" if percent >= 70 else ok or "#3ddc97"
+    return "#d9363e" if percent >= 90 else "#e57f10" if percent >= 70 else ok or "#1fa970"
 
 
 def blend(a: str, b: str, t: float) -> str:
@@ -312,13 +339,44 @@ def blend(a: str, b: str, t: float) -> str:
     return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(pa, pb))
 
 
-def pill(c, w, h, fill, edge):
-    """A stadium (full-radius pill): two end caps, a body, and top and bottom hairlines."""
-    c.create_oval(0, 0, h - 1, h - 1, fill=fill, outline=edge)
-    c.create_oval(w - h, 0, w - 1, h - 1, fill=fill, outline=edge)
-    c.create_rectangle(h // 2, 0, w - h // 2, h, fill=fill, outline="")
-    c.create_line(h // 2, 0, w - h // 2, 0, fill=edge)
-    c.create_line(h // 2, h - 1, w - h // 2, h - 1, fill=edge)
+SHAPES = ("Pill", "Notch", "Rounded rectangle", "Chips", "None")
+
+
+def flush_sides(work, x, y, w, h):
+    """(top, right, bottom, left): which sides of the window at (x, y) lie against the work area's edges."""
+    l, t, r, b = work
+    return (y <= t, x + w >= r, y + h >= b, x <= l)
+
+
+def shape_points(x0, y0, x1, y1, radii, ear=None):
+    """Outline of a rectangle with per-corner radii (tl, tr, br, bl). ear=("top"|"bottom", e) swaps the two corners on
+    that side for concave fillets that flare out to the screen edge (a notch's "ears"); the body is inset e each side."""
+    def arc(cx, cy, r, a0, a1):
+        if r < 1:
+            return [(cx, cy)]
+        n = max(3, int(r // 2))
+        return [(cx + r * math.cos(math.radians(a0 + (a1 - a0) * k / n)), cy + r * math.sin(math.radians(a0 + (a1 - a0) * k / n)))
+                for k in range(n + 1)]
+    tl, tr, br, bl = radii
+    if ear and ear[0] == "bottom":  # mirror of the top case
+        return [(x, y0 + y1 - y) for x, y in shape_points(x0, y0, x1, y1, (bl, br, tr, tl), ("top", ear[1]))]
+    if ear:
+        e = ear[1]
+        left = [(x0 + e * math.sin(math.radians(t)), y0 + e - e * math.cos(math.radians(t))) for t in range(0, 91, 10)]
+        return (left + arc(x0 + e + bl, y1 - bl, bl, 180, 90) + arc(x1 - e - br, y1 - br, br, 90, 0)
+                + [(x1 - x + x0, y) for x, y in reversed(left)])
+    return (arc(x0 + tl, y0 + tl, tl, 180, 270) + arc(x1 - tr, y0 + tr, tr, 270, 360)
+            + arc(x1 - br, y1 - br, br, 0, 90) + arc(x0 + bl, y1 - bl, bl, 90, 180))
+
+
+def backdrop(c, x0, y0, x1, y1, r, flush, fill, edge, ear=None):
+    """One shaped background: corners touching a flush side are square, the others keep radius r."""
+    t, rt, b, l = flush
+    radii = (0 if t or l else r, 0 if t or rt else r, 0 if b or rt else r, 0 if b or l else r)
+    c.create_polygon([v for pt in shape_points(x0, y0, x1, y1, radii, ear) for v in pt], fill=fill, outline=edge)
+    for on, line in ((t, (x0, y0, x1, y0)), (rt, (x1, y0, x1, y1)), (b, (x0, y1, x1, y1)), (l, (x0, y0, x0, y1))):
+        if on:  # no hairline along the screen edge itself
+            c.create_line(*line, fill=fill)
 
 
 def ring(c, cx, cy, R, wd, pct, state, spin, colour, track, bg, halo=True):
@@ -337,6 +395,59 @@ def ring(c, cx, cy, R, wd, pct, state, spin, colour, track, bg, halo=True):
     for a in (start, start + ext):                  # round caps
         x, y = cx + R * math.cos(math.radians(a)), cy - R * math.sin(math.radians(a))
         c.create_oval(x - wd / 2, y - wd / 2, x + wd / 2, y + wd / 2, fill=colour, outline=colour)
+
+
+# ---------- placement: snap spots, easing, work area ----------
+
+def snap_spots(work, w, h, margin):
+    """Eight (x, y) top-left spots inside work=(l, t, r, b): corners and edge middles, inset by margin.
+    Top-middle sits flush against the top (the classic notch spot)."""
+    l, t, r, b = work
+    xs, ys = (l + margin, (l + r - w) // 2, r - w - margin), (t + margin, (t + b - h) // 2, b - h - margin)
+    return [(x, t if (x, y) == (xs[1], ys[0]) else y) for y in ys for x in xs if (x, y) != (xs[1], ys[1])]
+
+
+def snap_all(work, hw, hh, vw, vh, sides=True):
+    """Spots as (x, y, w, h, vertical): top and bottom rows at the wide size, side middles at the column size."""
+    hs, vs = snap_spots(work, hw, hh, 0), snap_spots(work, vw, vh, 0)  # order: TL TM TR ML MR BL BM BR
+    return [hs[i] + (hw, hh, False) for i in (0, 1, 2, 5, 6, 7)] + ([vs[i] + (vw, vh, True) for i in (3, 4)] if sides else [])
+
+
+def nearest_by_centre(spots, cx, cy):
+    return min(spots, key=lambda s: (s[0] + s[2] / 2 - cx) ** 2 + (s[1] + s[3] / 2 - cy) ** 2)
+
+
+def nearest_spot(spots, x, y):
+    """The spot closest to the pill's top-left (x, y); same size pill, so this is also nearest by centre."""
+    return min(spots, key=lambda s: (s[0] - x) ** 2 + (s[1] - y) ** 2)
+
+
+def ease_out_back(t: float) -> float:
+    """0 -> 1 with a gentle overshoot (about 4%) on the way."""
+    c1 = 1.0
+    return 1 + (c1 + 1) * (t - 1) ** 3 + c1 * (t - 1) ** 2
+
+
+def work_area(x, y):
+    """(l, t, r, b) work area (no taskbar) of the monitor nearest the point (x, y); the primary screen if the call fails."""
+    import ctypes
+    from ctypes import wintypes as wt
+
+    class Info(ctypes.Structure):
+        _fields_ = [("cb", wt.DWORD), ("mon", wt.RECT), ("work", wt.RECT), ("flags", wt.DWORD)]
+
+    u = ctypes.windll.user32
+    try:
+        u.MonitorFromPoint.argtypes, u.MonitorFromPoint.restype = [wt.POINT, wt.DWORD], ctypes.c_void_p
+        u.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(Info)]
+        info = Info(ctypes.sizeof(Info))
+        u.GetMonitorInfoW(u.MonitorFromPoint(wt.POINT(int(x), int(y)), 2), ctypes.byref(info))  # 2 = DEFAULTTONEAREST
+        r = info.work
+        if r.right > r.left:
+            return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    return 0, 0, u.GetSystemMetrics(0), u.GetSystemMetrics(1)
 
 
 # ---------- the widget ----------
@@ -361,15 +472,25 @@ class Notch:
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", "#010203")  # Windows: everything this colour is see-through
         self.S = self.root.winfo_fpixels('1i') / 96
-        self.w, self.h = round(330 * self.S), round(40 * self.S)
+        self.layout = self.cfg.get("layout") if self.cfg.get("layout") in LAYOUTS else "Rings"
+        self.theme = self.cfg.get("theme") if self.cfg.get("theme") in THEMES else "Light"
+        self.w, self.h = round(LAYOUTS[self.layout][0] * self.S), round(LAYOUTS[self.layout][1] * self.S)
+        self.shape = self.cfg.get("shape") if self.cfg.get("shape") in SHAPES else "Pill"
+        self.margin, self.moving, self.edge = 0, False, THEMES[self.theme][1]  # margin 0: every spot sits flush on its edge
+        self.vert = bool(self.cfg.get("vert")) and SIDE_SPOTS
+        self.w, self.h = self.dims(self.vert)
         x = self.cfg.get("x", (self.root.winfo_screenwidth() - self.w) // 2)
-        self.root.geometry(f"{self.w}x{self.h}+{x}+{self.cfg.get('y', 0)}")
+        y = self.cfg.get("y", 0)
+        self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
+        x, y, self.w, self.h, self.vert = self.spot_for(x + self.w // 2, y + self.h // 2)  # saved spot -> nearest snap spot, no animation
+        self.root.geometry(f"{self.w}x{self.h}")
+        self.place(x, y)
         self.c = tk.Canvas(self.root, width=self.w, height=self.h, bg="#010203", highlightthickness=0)
         self.c.pack()
         self.tip = None
         self.c.bind("<ButtonPress-1>", self.press)
         self.c.bind("<B1-Motion>", self.drag)
-        self.c.bind("<ButtonRelease-1>", self.save_pos)
+        self.c.bind("<ButtonRelease-1>", self.release)
         self.c.bind("<Enter>", self.show_tip)
         self.c.bind("<Leave>", self.hide_tip)
         self.c.bind("<Button-3>", self.menu)
@@ -430,35 +551,105 @@ class Notch:
             self.root.after(STATE_EVERY * 1000 if not any(d["state"] == WORKING for d in self.data.values()) else 120, self.poll_state)
 
     # drawing
-    def fonts(self):
-        from tkinter import font as tkf
-        if not hasattr(self, "fn"):
-            self.fn = {k: tkf.Font(root=self.root, family=f, size=z) for k, (f, z) in FONTS.items()}
-        return self.fn
-
-    def txt(self, x, base, text, key, fill, anchor="w"):
-        """Place text by BASELINE so names and percents of different sizes sit on one line."""
-        f = self.fonts()[key]
+    def txt(self, x, base, text, spec, fill, anchor="w"):
+        """Place text by BASELINE so texts of different sizes sit on one line. spec = (family, points)."""
+        f = self.font(spec)
         self.c.create_text(x, base - f.metrics("ascent"), text=text, anchor="n" + anchor, fill=fill, font=f)
         return f.measure(text)
 
-    def draw(self):
-        # light frosted pill: ring left, percent big over a small name; reads like a system widget
-        c, S, w, h = self.c, self.S, self.w, self.h
-        c.delete("all")
-        pill(c, w, h, BG, EDGE)
+    def font(self, spec):
+        from tkinter import font as tkf
+        self.fn = getattr(self, "fn", {})
+        if spec not in self.fn:
+            self.fn[spec] = tkf.Font(root=self.root, family=spec[0], size=spec[1])
+        return self.fn[spec]
+
+    def segments(self):
+        """[(title, percent, short reset, state, has numbers, error)] for Claude, Fable, Codex."""
         claude, codex = self.data["claude"], self.data["codex"]
         fable = [win for win in claude["windows"] if win[0] == FABLE]
-        segments = (("Claude", claude_ring(claude["windows"]), claude["state"], claude["err"]), ("Fable", fable, IDLE, claude["err"]),
-                    ("Codex", codex["windows"], codex["state"], codex["err"]))
-        col = (w - 20 * S) / 3
-        for i, (title, windows, state, err) in enumerate(segments):
-            x0 = 20 * S + i * col
-            pct = max((p for _, p, _ in windows), default=0)
-            colour = ring_colour(pct, state)
-            ring(c, x0 + 11 * S, h / 2, 10 * S, max(3, round(3.2 * S)), pct, state, self.spin, colour, TRACK, BG)
-            self.txt(x0 + 30 * S, h / 2 + 1 * S, f"{pct:.0f}%" if windows else "--", "pct", TEXT if not err else MUTED)
-            self.txt(x0 + 30 * S, h / 2 + 11 * S, title, "name", MUTED)
+        out = []
+        for title, windows, state, err in (("Claude", claude_ring(claude["windows"]), claude["state"], claude["err"]),
+                                           ("Fable", fable, IDLE, claude["err"]), ("Codex", codex["windows"], codex["state"], codex["err"])):
+            top = max(windows, key=lambda win: win[1], default=None)  # the fullest window: its reset is the one shown
+            out.append((title, top[1] if top else 0, rshort(top[2]) if top else "", state, bool(windows), err))
+        return out
+
+    def draw(self):
+        c, S, w, h = self.c, self.S, self.w, self.h
+        bg, edge, track, text, muted, ok, dark = THEMES[self.theme]
+        c.delete("all")
+        px, py = self.pos
+        flush = (False,) * 4 if self.moving else flush_sides(work_area(px + w // 2, py + h // 2), px, py, w, h)  # dragging: floats, fully round
+        e = 12 * S if self.shape == "Notch" and flush[0] != flush[2] and not (flush[1] or flush[3]) else 0  # ears: top/bottom-middle only
+        ear = ("top" if flush[0] else "bottom", e) if e else None
+        sh, g, V = LAYOUTS[self.layout][1] * S, GAP * S, self.vert  # one segment's height; V: stacked column on a side spot
+        r = {"Pill": sh / 2, "Notch": 15 * S, "Rounded rectangle": 8 * S, "Chips": sh / 2}.get(self.shape, 0)
+        if V:  # three boxes stacked top to bottom, full width
+            boxes = [(0, i * (sh + g), w) for i in range(3)]
+        elif self.shape == "Chips":  # three equal chips side by side
+            bw = (w - 2 * g) / 3
+            boxes = [(i * (bw + g), 0, bw) for i in range(3)]
+        else:  # one background, three equal thirds inside it
+            pad = {"Pill": 16, "Notch": 12, "Rounded rectangle": 10}.get(self.shape, 10) * S + e
+            boxes = [(pad + i * (w - 2 * pad) / 3, 0, (w - 2 * pad) / 3) for i in range(3)]
+        if self.shape == "Chips":  # each chip is a shape of its own; only the chips touching a flush side get square corners
+            for i, (bx, by, bw) in enumerate(boxes):
+                fl = (flush[0] and (i == 0 or not V), flush[1] and (V or i == 2), flush[2] and (i == 2 or not V), flush[3] and (V or i == 0))
+                backdrop(c, bx, by, bx + bw - 1, by + sh - 1, r, fl, bg, self.edge)
+        elif self.shape != "None":
+            backdrop(c, 0, 0, w - 1, h - 1, r, flush, bg, self.edge, ear)
+        segs = self.segments()
+        SMALL, SEMI7, SEMI9, SEMI11 = ("Segoe UI", 7), ("Segoe UI Semibold", 7), ("Segoe UI Semibold", 9), ("Segoe UI Semibold", 11)
+        m = lambda spec, t: self.font(spec).measure(t)
+        pct_text = lambda s_: (f"{s_[1]:.0f}" if s_[4] else "--")
+        R = 14.5 * S
+        if self.layout == "Rings":  # content width: the widest segment, so every segment sits the same way in its box
+            cw = 30 * S + max(max(m(SEMI11, pct_text(s_) + "%"), m(SMALL, s_[0]) + 6 * S + m(SEMI7, s_[2])) for s_ in segs)
+        elif self.layout == "Number in ring":
+            cw = 2 * R + 9 * S + max(max(m(SEMI9, s_[0]), m(("Segoe UI", 8), "resets " + s_[2])) for s_ in segs)
+        for i, ((title, pct, reset, state, has, err), (bx, by, bw_)) in enumerate(zip(segs, boxes)):
+            cy = by + sh / 2
+            colour, num = ring_colour(pct, state, dark, ok), pct_text(segs[i])
+            fg = text if not err else muted
+            if self.layout == "Rings":  # ring left; percent over name and reset
+                x0 = bx + (bw_ - cw) / 2
+                ring(c, x0 + 11 * S, cy, 10 * S, max(3, round(3.2 * S)), pct, state, self.spin, colour, track, bg)
+                self.txt(x0 + 30 * S, cy + 1 * S, num + ("%" if has else ""), SEMI11, fg)
+                n = self.txt(x0 + 30 * S, cy + 11 * S, title, SMALL, muted)
+                self.txt(x0 + 30 * S + n + 6 * S, cy + 11 * S, reset, SEMI7, text)
+            elif self.layout == "Number in ring":  # percent inside a bigger ring; name and reset beside it
+                x0 = bx + (bw_ - cw) / 2
+                ring(c, x0 + R, cy, R, max(3, round(3.4 * S)), pct, state, self.spin, colour, track, bg)
+                self.txt(x0 + R, cy + 4.5 * S, num, SEMI9, fg, "")
+                tx = x0 + 2 * R + 9 * S
+                self.txt(tx, cy - 1 * S, title, SEMI9, text)
+                self.txt(tx, cy + 11 * S, "resets " + reset if reset else "", ("Segoe UI", 8), muted)
+            else:  # Bars: name and percent on top, a bar and the reset underneath
+                x0, x1 = bx + 14 * S, bx + bw_ - 14 * S
+                self.txt(x0, cy - 3 * S, title, ("Segoe UI Semibold", 8), muted)
+                self.txt(x1, cy - 3 * S, num + ("%" if has else ""), ("Segoe UI Semibold", 12), fg, "e")
+                self.bar(x0 + 2 * S, cy + 9 * S, (x1 - x0) - m(SMALL, reset) - 10 * S, pct, state, colour)
+                self.txt(x1, cy + 12 * S, reset, SMALL, muted, "e")
+            if i and self.shape != "Chips":  # faint divider between segments
+                if V:
+                    c.create_line(14 * S, by - g / 2, w - 14 * S, by - g / 2, fill=track)
+                else:
+                    c.create_line(bx, cy - 10 * S, bx, cy + 10 * S, fill=track)
+
+    def bar(self, x, y, length, pct, state, colour):
+        bg, track = THEMES[self.theme][0], THEMES[self.theme][2]
+        t = max(3, round(4 * self.S))
+        self.c.create_line(x, y, x + length, y, fill=track, width=t, capstyle="round")
+        if state == WORKING:  # a chunk slides along the bar
+            a = self.spin / 360 * length * .7
+            seg = (x + a, y, x + a + length * .3, y)
+        elif pct:
+            seg = (x, y, x + max(length * min(pct, 100) / 100, t), y)
+        else:
+            return
+        self.c.create_line(*seg, fill=blend(colour, bg, .6), width=t + 1, capstyle="round")
+        self.c.create_line(*seg, fill=colour, width=t, capstyle="round")
 
     def tip_text(self) -> str:
         lines = []
@@ -471,7 +662,7 @@ class Notch:
                 lines.append(f"   ({d['err']})")
             if d["at"] and time.time() - d["at"] > 5 * USAGE_EVERY:
                 lines.append(f"   (stale, {round((time.time() - d['at']) / 60)} min old)")
-        lines.append("double-click: refresh   right-click: refresh / quit")
+        lines.append("double-click: refresh   right-click: move / layout / colour / shape / refresh / quit")
         return "\n".join(lines)
 
     # mouse
@@ -480,31 +671,112 @@ class Notch:
         self.tip = self.tk.Toplevel(self.root)
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        self.tip.geometry(f"+{self.root.winfo_x()}+{self.root.winfo_y() + self.h + 4}")
-        self.tk.Label(self.tip, text=self.tip_text(), justify="left", bg=BG, fg=TEXT, font=("Segoe UI", 9), padx=12, pady=8,
-                      highlightthickness=1, highlightbackground=EDGE).pack()
+        bg, edge, _, text, *_ = THEMES[self.theme]
+        self.tk.Label(self.tip, text=self.tip_text(), justify="left", bg=bg, fg=text, font=("Segoe UI", 9), padx=12, pady=8,
+                      highlightthickness=1, highlightbackground=edge).pack()
+        self.tip.update_idletasks()
+        tw, th, px, py = self.tip.winfo_reqwidth(), self.tip.winfo_reqheight(), self.root.winfo_x(), self.root.winfo_y()
+        l, t, r, b = work_area(px + self.w // 2, py + self.h // 2)
+        x = px + self.w - tw if px + self.w // 2 > (l + r) / 2 else px          # right half: right-align to the pill
+        y = py - th - 4 if py + self.h // 2 > (t + b) / 2 else py + self.h + 4  # bottom half: above the pill
+        self.tip.geometry(f"+{x}+{y}")
 
     def hide_tip(self, _=None):
         if self.tip:
             self.tip.destroy()
             self.tip = None
 
-    def press(self, e):
+    # moving: locked by default; right-click > Move, drag, release -> snap, glide, lock
+    def place(self, x, y):
+        self.pos = x, y  # drawing reads this (flush sides), so it is right before the window is even mapped
+        self.root.geometry(f"+{x}+{y}")
+
+    def dims(self, vert):
+        """Window size in pixels: the layout's wide size, or on a side spot a column of three stacked segments."""
+        W, H = LAYOUTS[self.layout]
+        W, H = (VCOL[self.layout], 3 * H + 2 * GAP) if vert else (W, H)
+        return round(W * self.S), round(H * self.S)
+
+    def spot_for(self, cx, cy):
+        """Nearest snap spot to a window centre: (x, y, w, h, vertical)."""
+        (hw, hh), (vw, vh) = self.dims(False), self.dims(True)
+        return nearest_by_centre(snap_all(work_area(cx, cy), hw, hh, vw, vh, SIDE_SPOTS), cx, cy)
+
+    def fit(self, w, h, vert):
+        self.w, self.h, self.vert = w, h, vert
+        self.c.config(width=w, height=h)
+        self.root.geometry(f"{w}x{h}")
+
+    def start_move(self):
         self.hide_tip()
-        self.drag_from = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+        self.moving, self.edge, self.drag_from = True, ACCENT, None
+        self.c.config(cursor="fleur")
+        self.draw()
+
+    def press(self, e):
+        if self.moving:
+            self.hide_tip()
+            self.drag_from = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
 
     def drag(self, e):
-        self.root.geometry(f"+{e.x_root - self.drag_from[0]}+{e.y_root - self.drag_from[1]}")
+        if self.moving and self.drag_from:
+            self.place(e.x_root - self.drag_from[0], e.y_root - self.drag_from[1])
 
-    def save_pos(self, _=None):
-        self.cfg.update(x=self.root.winfo_x(), y=self.root.winfo_y())
+    def release(self, _=None):
+        if not self.moving or self.drag_from is None:  # a stray release (e.g. from the menu click) must not end move mode
+            return
+        self.moving = False
+        self.c.config(cursor="")
+        x0, y0 = self.root.winfo_x(), self.root.winfo_y()
+        x1, y1, w1, h1, v1 = self.spot_for(x0 + self.w // 2, y0 + self.h // 2)
+        l, t, r, b = work_area(x1 + w1 // 2, y1 + h1 // 2)
+        self.cfg.update(x=x1, y=y1, vert=v1)  # save the spot, not the drop point
         _write_json(CONFIG, self.cfg)
+        N = 16  # ~250 ms at 16 ms a frame
+
+        def glide(i):
+            if i >= N:
+                self.fit(w1, h1, v1)  # switch between wide and column only when it lands
+                self.place(x1, y1)
+                return pulse(0)
+            k = ease_out_back(i / N)  # clamp so the overshoot never leaves the work area
+            self.place(min(max(round(x0 + (x1 - x0) * k), l), r - min(self.w, w1)), min(max(round(y0 + (y1 - y0) * k), t), b - min(self.h, h1)))
+            self.root.after(16, glide, i + 1)
+
+        def pulse(i):  # ~300 ms: accent fades back to the normal edge
+            self.edge = blend(ACCENT, THEMES[self.theme][1], min(i / 18, 1))
+            self.draw()
+            if i < 18:
+                self.root.after(16, pulse, i + 1)
+
+        glide(1)
 
     def menu(self, e):
         m = self.tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Move", command=self.start_move)
+        self.pick = {k: self.tk.StringVar(value=getattr(self, k)) for k in ("layout", "theme", "shape")}  # kept alive
+        for label, key, names in (("Layout", "layout", LAYOUTS), ("Colour", "theme", THEMES), ("Shape", "shape", SHAPES)):
+            sub = self.tk.Menu(m, tearoff=0)
+            for n in names:
+                sub.add_radiobutton(label=n, variable=self.pick[key], value=n, command=lambda k=key, n=n: self.choose(k, n))
+            m.add_cascade(label=label, menu=sub)
         m.add_command(label="Refresh now", command=lambda: self.poll_usage(loop=False))
         m.add_command(label="Quit", command=self.quit)
         m.tk_popup(e.x_root, e.y_root)
+
+    def choose(self, key, name):
+        """Switch layout, colour or shape now and remember it. A new layout is another size: keep the pill's centre, re-snap."""
+        self.cfg[key] = name
+        setattr(self, key, name)
+        if key == "theme":
+            self.edge = THEMES[name][1]
+        elif key == "layout":
+            x, y, w, h, v = self.spot_for(self.pos[0] + self.w // 2, self.pos[1] + self.h // 2)
+            self.fit(w, h, v)
+            self.place(x, y)
+            self.cfg.update(x=x, y=y, vert=v)
+        _write_json(CONFIG, self.cfg)
+        self.draw()
 
     def quit(self):
         release_instance()
@@ -584,7 +856,25 @@ def selftest():
     assert len(st["hooks"]["Stop"]) == 2 and len(st["hooks"]["Notification"]) == 2 and st["hooks"]["Stop"][0]["hooks"][0]["command"] == "theirs"
     assert remove_hooks(st)["hooks"] == {"Stop": [{"hooks": [{"type": "command", "command": "theirs"}]}]}
     assert reset_text(now + 50 * 60, now) == "resets in 50 min" and reset_text(now + 3 * 3600 + 120, now) == "resets in 3 h 2 min"
+    work, W, H, M = (0, 0, 1920, 1040), 330, 40, 8
+    sp = snap_spots(work, W, H, M)
+    assert len(set(sp)) == 8 and all(0 <= x and x + W <= 1920 and 0 <= y and y + H <= 1040 for x, y in sp), sp
+    assert (795, 0) in sp and nearest_spot(sp, 900, 5) == (795, 0)  # top-middle is flush against the top
+    assert nearest_spot(sp, 1500, 900) == (1582, 992) and nearest_spot(sp, 30, 20) == (8, 8)  # corners
+    assert nearest_spot(sp, 780, 950) == (795, 992)  # bottom-middle
+    assert ease_out_back(0) == 0 and ease_out_back(1) == 1 and max(ease_out_back(i / 100) for i in range(100)) > 1
     assert ring_colour(95, IDLE) == "#d9363e" and ring_colour(5, WAITING) == "#d69a00"
+    assert [rshort(now + s, now) for s in (-5, 2999, 7800, 90000, 3 * 86400 + 4 * 3600 + 9)] == ["", "49m", "2h 10m", "1d 1h", "3d 4h"]
+    sp0 = snap_spots(work, W, H, 0)  # margin 0: every spot flush; the flush sides follow
+    assert (0, 0) in sp0 and (1590, 1000) in sp0 and (795, 0) in sp0 and (0, 500) in sp0
+    assert flush_sides(work, 0, 0, W, H) == (True, False, False, True) and flush_sides(work, 795, 1000, W, H) == (False, False, True, False)
+    assert flush_sides(work, 1590, 500, W, H) == (False, True, False, False) and flush_sides(work, 500, 300, W, H) == (False,) * 4
+    sp = snap_all(work, W, H, 150, 185, True)  # side middles are columns, flush on their edge; sides off -> six spots
+    assert len(sp) == 8 and [s for s in sp if s[4]] == [(0, 427, 150, 185, True), (1770, 427, 150, 185, True)] and len(snap_all(work, W, H, 150, 185, False)) == 6
+    assert nearest_by_centre(sp, 40, 520)[4] and not nearest_by_centre(sp, 100, 20)[4]
+    pts = shape_points(0, 0, 99, 39, (0, 0, 20, 20), ("top", 8))
+    assert pts[0] == (0, 0) and min(x for x, _ in pts) == 0 and max(y for _, y in pts) <= 39 and shape_points(0, 0, 9, 9, (0,) * 4)
+    assert "Light" in THEMES and all(re.fullmatch(r"#[0-9a-f]{6}", c) for p in THEMES.values() for c in p[:6])
     import tempfile
     with tempfile.TemporaryDirectory() as td:  # a held target makes os.replace fail: must retry, then give up quietly
         f = Path(td) / "u.json"
